@@ -59,8 +59,10 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset({
 })
 
 # List of architectures that don't have pipeline parallelism support in jax yet.
-_PP_DISABLED_MODELS: frozenset[str] = frozenset(
-    {"DeepseekV3ForCausalLM", "Eagle3LlamaForCausalLM", "GptOssForCausalLM"})
+_PP_DISABLED_MODELS: frozenset[str] = frozenset({
+    "DeepseekV3ForCausalLM", "DeepseekV2ForCausalLM", "Eagle3LlamaForCausalLM",
+    "GptOssForCausalLM"
+})
 
 
 class UnsupportedArchitectureError(ValueError):
@@ -88,6 +90,9 @@ def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
     from tpu_inference.models.jax.qwen3_moe import Qwen3MoeForCausalLM
     _MODEL_REGISTRY["Llama4ForCausalLM"] = Llama4ForCausalLM
     _MODEL_REGISTRY["DeepseekV3ForCausalLM"] = DeepseekV3ForCausalLM
+    # DeepSeek-V2 / V2-Lite share the V3 MLA-MoE implementation; architecture
+    # hyper-parameters are read from hf_config at construction time.
+    _MODEL_REGISTRY["DeepseekV2ForCausalLM"] = DeepseekV3ForCausalLM
     _MODEL_REGISTRY["LlamaForCausalLM"] = LlamaForCausalLM
     _MODEL_REGISTRY["Llama4ForConditionalGeneration"] = LlamaGuard4ForCausalLM
     _MODEL_REGISTRY["Qwen3ForCausalLM"] = Qwen3ForCausalLM

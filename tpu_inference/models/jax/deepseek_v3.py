@@ -83,6 +83,9 @@ ffw_intermediate_size: int = 18432
 moe_intermediate_size: int = 2048
 num_experts_per_token: int = 8
 n_group: int = 8
+topk_group: int = 4  # expert groups selected per token (V3); V2-Lite uses 1
+norm_topk_prob: bool = True  # V3 normalizes top-k weights; V2-Lite does not
+topk_method: str = "noaux_tc"  # V3 aux-loss-free routing; V2-Lite uses "greedy"
 interleave_moe_layer_step: int = 1  # Deepseek V3 has moe_layer_freq=1 in hf config.
 hidden_act: str = "silu"
 rms_norm_eps: float = 1e-06
@@ -106,6 +109,64 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 expert_axis_name = ShardingAxisName.ATTN_DATA_EXPERT
+
+
+def _populate_config_globals(hf_config) -> None:
+    """Populate the module-level config globals from the HF config.
+
+    The DeepSeek model classes read their architecture hyper-parameters from
+    module globals (baked to DeepSeek-V3 values above). This populates them from
+    the actual ``hf_config`` so the same code serves both DeepSeek-V3 and
+    DeepSeek-V2 / V2-Lite. Each field falls back to the existing V3 global when
+    absent, so V3 behavior is byte-identical when given a V3 config.
+    """
+    global num_local_experts, vocab_size, hidden_size, num_attention_heads
+    global num_key_value_heads, ffw_intermediate_size, moe_intermediate_size
+    global num_experts_per_token, n_group, topk_group, norm_topk_prob
+    global topk_method, interleave_moe_layer_step, hidden_act, rms_norm_eps
+    global routed_scaling_factor, first_k_dense_replace, num_shared_experts
+    global rope_theta, rope_scaling, q_lora_rank, kv_lora_rank
+    global qk_nope_head_dim, qk_rope_head_dim, v_head_dim
+
+    num_local_experts = getattr(hf_config, "n_routed_experts", num_local_experts)
+    vocab_size = getattr(hf_config, "vocab_size", vocab_size)
+    hidden_size = getattr(hf_config, "hidden_size", hidden_size)
+    num_attention_heads = getattr(hf_config, "num_attention_heads",
+                                  num_attention_heads)
+    # MLA forces num_key_value_heads=1 downstream; default to num heads otherwise.
+    num_key_value_heads = getattr(hf_config, "num_key_value_heads",
+                                  num_attention_heads)
+    ffw_intermediate_size = getattr(hf_config, "intermediate_size",
+                                    ffw_intermediate_size)
+    moe_intermediate_size = getattr(hf_config, "moe_intermediate_size",
+                                    moe_intermediate_size)
+    num_experts_per_token = getattr(hf_config, "num_experts_per_tok",
+                                    num_experts_per_token)
+    n_group = getattr(hf_config, "n_group", n_group)
+    topk_group = getattr(hf_config, "topk_group", topk_group)
+    norm_topk_prob = getattr(hf_config, "norm_topk_prob", norm_topk_prob)
+    topk_method = getattr(hf_config, "topk_method", topk_method)
+    interleave_moe_layer_step = getattr(hf_config, "moe_layer_freq",
+                                        interleave_moe_layer_step)
+    hidden_act = getattr(hf_config, "hidden_act", hidden_act)
+    rms_norm_eps = getattr(hf_config, "rms_norm_eps", rms_norm_eps)
+    routed_scaling_factor = getattr(hf_config, "routed_scaling_factor",
+                                    routed_scaling_factor)
+    first_k_dense_replace = getattr(hf_config, "first_k_dense_replace",
+                                    first_k_dense_replace)
+    num_shared_experts = getattr(hf_config, "n_shared_experts",
+                                 num_shared_experts)
+    rope_theta = getattr(hf_config, "rope_theta", rope_theta)
+    _rope_scaling = getattr(hf_config, "rope_scaling", None)
+    if _rope_scaling:
+        # Merge over V3 defaults so missing keys (e.g. beta_fast/beta_slow) remain.
+        rope_scaling = {**rope_scaling, **_rope_scaling}
+    # q_lora_rank may legitimately be None (V2-Lite uses a plain q_proj).
+    q_lora_rank = getattr(hf_config, "q_lora_rank", q_lora_rank)
+    kv_lora_rank = getattr(hf_config, "kv_lora_rank", kv_lora_rank)
+    qk_nope_head_dim = getattr(hf_config, "qk_nope_head_dim", qk_nope_head_dim)
+    qk_rope_head_dim = getattr(hf_config, "qk_rope_head_dim", qk_rope_head_dim)
+    v_head_dim = getattr(hf_config, "v_head_dim", v_head_dim)
 
 
 @dataclass(kw_only=True)
@@ -176,24 +237,40 @@ class DeepseekV3BaseAttention(JaxModule):
 
         weight_init = _weight_init(self.random_init)
 
-        self.q_a_proj = JaxEinsum(
-            einsum_str="TD,DA->TA",
-            kernel_shape=(self.D, self.q_lora_rank),
-            rngs=rngs,
-            quant_config=self.quant_config,
-            param_dtype=self.dtype,
-            kernel_init=nnx.with_partitioning(weight_init, self.q_da_sharding),
-            prefix=self.prefix + ".q_a_proj",
-        )
+        # When q_lora_rank is set (V3) the query is down/up projected through a
+        # LoRA pair (q_a_proj -> q_a_layernorm -> q_b_proj). When it is None
+        # (V2-Lite) the query uses a single full q_proj.
+        if self.q_lora_rank is not None:
+            self.q_a_proj = JaxEinsum(
+                einsum_str="TD,DA->TA",
+                kernel_shape=(self.D, self.q_lora_rank),
+                rngs=rngs,
+                quant_config=self.quant_config,
+                param_dtype=self.dtype,
+                kernel_init=nnx.with_partitioning(weight_init,
+                                                  self.q_da_sharding),
+                prefix=self.prefix + ".q_a_proj",
+            )
 
-        self.q_b_proj = JaxEinsum(
-            einsum_str="TA,AP->TP",
-            kernel_shape=(self.q_lora_rank, self.N * self.qk_head_dim),
-            rngs=rngs,
-            quant_config=self.quant_config,
-            param_dtype=self.dtype,
-            kernel_init=nnx.with_partitioning(weight_init, self.ap_sharding),
-            prefix=self.prefix + ".q_b_proj")
+            self.q_b_proj = JaxEinsum(
+                einsum_str="TA,AP->TP",
+                kernel_shape=(self.q_lora_rank, self.N * self.qk_head_dim),
+                rngs=rngs,
+                quant_config=self.quant_config,
+                param_dtype=self.dtype,
+                kernel_init=nnx.with_partitioning(weight_init,
+                                                  self.ap_sharding),
+                prefix=self.prefix + ".q_b_proj")
+        else:
+            self.q_proj = JaxEinsum(
+                einsum_str="TD,DP->TP",
+                kernel_shape=(self.D, self.N * self.qk_head_dim),
+                rngs=rngs,
+                quant_config=self.quant_config,
+                param_dtype=self.dtype,
+                kernel_init=nnx.with_partitioning(weight_init,
+                                                  self.ap_sharding),
+                prefix=self.prefix + ".q_proj")
 
         self.kv_a_proj_with_mqa = JaxEinsum(
             einsum_str="SD,DA->SA",
@@ -214,15 +291,16 @@ class DeepseekV3BaseAttention(JaxModule):
             kernel_init=nnx.with_partitioning(weight_init, self.rd_sharding),
             prefix=self.prefix + ".o_proj")
 
-        self.q_a_layernorm = JaxRmsNorm(self.q_lora_rank,
-                                        epsilon=self.rms_norm_eps,
-                                        scale_init=nnx.with_partitioning(
-                                            init_fn, (None, )),
-                                        param_dtype=self.dtype,
-                                        dtype=self.dtype,
-                                        quant_config=self.quant_config,
-                                        prefix=self.prefix + ".q_a_layernorm",
-                                        rngs=rngs)
+        if self.q_lora_rank is not None:
+            self.q_a_layernorm = JaxRmsNorm(
+                self.q_lora_rank,
+                epsilon=self.rms_norm_eps,
+                scale_init=nnx.with_partitioning(init_fn, (None, )),
+                param_dtype=self.dtype,
+                dtype=self.dtype,
+                quant_config=self.quant_config,
+                prefix=self.prefix + ".q_a_layernorm",
+                rngs=rngs)
 
         self.kv_a_layernorm = JaxRmsNorm(
             self.kv_lora_rank,
@@ -249,6 +327,20 @@ class DeepseekV3BaseAttention(JaxModule):
             kernel_init=nnx.with_partitioning(init_fn, self.ap_sharding),
             prefix=self.prefix + ".kv_b_proj",
         )
+
+    def _compute_q_TNH(self, x_q_TD: jax.Array) -> jax.Array:
+        """Project queries to ``(tokens, num_heads, qk_head_dim)``.
+
+        Uses the LoRA q_a/q_b pair when ``q_lora_rank`` is set (DeepSeek-V3) or a
+        single full ``q_proj`` when it is None (DeepSeek-V2-Lite).
+        """
+        if self.q_lora_rank is not None:
+            q_TA = self.q_a_proj(x_q_TD)
+            q_TA = self.q_a_layernorm(q_TA)
+            q_TP = self.q_b_proj(q_TA)
+        else:
+            q_TP = self.q_proj(x_q_TD)
+        return q_TP.reshape(q_TP.shape[0], self.N, self.qk_head_dim)
 
     @abstractmethod
     def compute_q_projection(self, *args) -> jax.Array:
@@ -344,10 +436,7 @@ class DeepseekV3Attention(DeepseekV3BaseAttention):
         Returns:
             The query tensor of shape `(tokens_query, num_query_heads, head_dim)`.
         """
-        q_TA = self.q_a_proj(x_q_TD)
-        q_TA = self.q_a_layernorm(q_TA)
-        q_TP = self.q_b_proj(q_TA)
-        q_TNH = q_TP.reshape(q_TA.shape[0], self.N, self.qk_head_dim)
+        q_TNH = self._compute_q_TNH(x_q_TD)
 
         q_nope_TNH = q_TNH[..., :self.qk_nope_head_dim]
         q_rope_TNH = q_TNH[..., self.qk_nope_head_dim:]
@@ -522,6 +611,48 @@ class MLAEinsum(JaxEinsum):
             self.loaded.add(name)
         if len(self.loaded) != len(named_params):
             return
+        if self.quant_config is None:
+            # Unquantized (bf16) path, e.g. DeepSeek-V2-Lite: split the loaded
+            # kv_b_proj weight directly into k_up_proj / v_up_proj with no fp8
+            # dequant. Mirrors the quantized path below minus quantization.
+            A, N, qk_nope_head_dim, v_head_dim = (
+                self.mla_layer.kv_lora_rank, self.mla_layer.N,
+                self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim)
+            with cpu_mesh_context():
+                weight_AL = self.weight.value
+                if weight_AL.shape != (A, N * (qk_nope_head_dim + v_head_dim)):
+                    raise ValueError(
+                        f"Unexpected kv_b_proj weight shape {weight_AL.shape}, "
+                        f"expected {(A, N * (qk_nope_head_dim + v_head_dim))}")
+                weight_ANH = weight_AL.reshape(A, N,
+                                               qk_nope_head_dim + v_head_dim)
+                k_ANH, v_ANH = jnp.split(weight_ANH, [qk_nope_head_dim],
+                                         axis=-1)
+            mla_layer = self.mla_layer
+            setattr(
+                mla_layer, "k_up_proj",
+                JaxEinsum(
+                    einsum_str="TNH,ANH->NTA",
+                    kernel_shape=(A, N, qk_nope_head_dim),
+                    rngs=nnx.Rngs(0),
+                    prefix=mla_layer.prefix + ".k_up_proj",
+                    quant_config=None,
+                ))
+            setattr(
+                mla_layer, "v_up_proj",
+                JaxEinsum(
+                    einsum_str="NTA,ANH->TNH",
+                    kernel_shape=(A, N, v_head_dim),
+                    rngs=nnx.Rngs(0),
+                    prefix=mla_layer.prefix + ".v_up_proj",
+                    quant_config=None,
+                ))
+            mla_layer.k_up_proj.weight.value = shard_put(
+                k_ANH, self.mla_layer.anh_sharding)
+            mla_layer.v_up_proj.weight.value = shard_put(
+                v_ANH, self.mla_layer.anh_sharding)
+            delattr(self, 'weight')
+            return
         assert self.quant_config is not None
         # After loading, split the weights into k/v
         with cpu_mesh_context():
@@ -618,10 +749,7 @@ class DeepseekV3MLA(DeepseekV3BaseAttention):
             A tuple of query tensor of shape `(tokens_query, num_query_heads, q_lora_rank)` and
             rope tensor of shape `(tokens_query, num_query_heads, head_dim)`.
         """
-        q_TA = self.q_a_proj(x_q_TD)
-        q_TA = self.q_a_layernorm(q_TA)
-        q_TP = self.q_b_proj(q_TA)
-        q_TNH = q_TP.reshape(q_TA.shape[0], self.N, self.qk_head_dim)
+        q_TNH = self._compute_q_TNH(x_q_TD)
 
         q_nope_TNH = q_TNH[..., :self.qk_nope_head_dim]
         q_rope_TNH = q_TNH[..., self.qk_nope_head_dim:]
@@ -860,8 +988,8 @@ class DeepseekV2Moe(JaxModule):
             num_experts=num_local_experts,
             num_experts_per_tok=num_experts_per_token,
             n_groups=n_group,
-            topk_groups=4,
-            norm_topk_prob=True,
+            topk_groups=topk_group,
+            norm_topk_prob=norm_topk_prob,
             rngs=rng,
             routed_scaling_factor=routed_scaling_factor,
             dtype=dtype,
@@ -1036,12 +1164,20 @@ class DeepSeekV3Router(JaxEinsum):
             param_dtype=self.dtype,
             kernel_init=nnx.with_partitioning(weight_init, self.ed_sharding),
         )
-        self.e_score_correction_bias = create_param(
-            rngs,
-            shape=(E, ),
-            dtype=self.router_bias_dtype,
-            sharding=self.e_sharding,
-            random_init=self.random_init)
+        # Aux-loss-free routing (V3, topk_method="noaux_tc") adds a learned
+        # per-expert bias during top-k selection. V2-Lite (greedy/softmax) has
+        # no such weight, so don't create it (the strict loader would otherwise
+        # fail on the missing param).
+        self.add_correction_bias = topk_method == "noaux_tc"
+        if self.add_correction_bias:
+            self.e_score_correction_bias = create_param(
+                rngs,
+                shape=(E, ),
+                dtype=self.router_bias_dtype,
+                sharding=self.e_sharding,
+                random_init=self.random_init)
+        else:
+            self.e_score_correction_bias = None
 
     def get_topk_indices(self, scores_TE: Float) -> Float:
         """Get the topk indices of the scores.
@@ -1053,7 +1189,8 @@ class DeepSeekV3Router(JaxEinsum):
             The topk indices of the scores. Shape (sequence, num_experts_per_tok).
         """
 
-        scores_TE = scores_TE + self.e_score_correction_bias
+        if self.e_score_correction_bias is not None:
+            scores_TE = scores_TE + self.e_score_correction_bias
         if self.n_groups > 1:
             experts_per_group = self.num_experts // self.n_groups
             group_scores_TGM = jnp.reshape(
@@ -1129,6 +1266,10 @@ class DeepSeekV3(JaxModule):
                  quant_config,
                  prefix: str = ""):
         self.vllm_config = vllm_config
+        # Populate the module config globals from this model's HF config so the
+        # same classes serve DeepSeek-V3 and DeepSeek-V2/V2-Lite. Must run before
+        # any layer (embed/rope/attention/moe) is constructed below.
+        _populate_config_globals(vllm_config.model_config.hf_config)
         self.enable_return_routed_experts = self.vllm_config.model_config.enable_return_routed_experts
 
         self.use_mla_kernel: bool = self.vllm_config.model_config.use_mla
