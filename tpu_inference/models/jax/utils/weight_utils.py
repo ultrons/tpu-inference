@@ -884,12 +884,17 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                 # beyond standard transformers, please consider setting weight_loader.
                 reshape_dims = None
                 permute_dims = None
-                if any(substr in name
-                       for substr in ["k_proj.weight", "v_proj.weight"]):
+                # These branches reshape standard-transformer 3D attention
+                # kernels. DeepSeek's einsum projections are 2D and load as-is
+                # (reshape_dims=None), so guard each unpack on ndim == 3.
+                if (any(substr in name
+                        for substr in ["k_proj.weight", "v_proj.weight"])
+                        and param.get_value().ndim == 3):
                     D, N, H = param.get_value().shape
                     reshape_dims = (N, H, D)
                     permute_dims = (2, 0, 1)
-                if any(substr in name for substr in ["q_proj.weight"]):
+                if (any(substr in name for substr in ["q_proj.weight"])
+                        and param.get_value().ndim == 3):
                     if envs.LAYOUT_Q_PROJ_AS_NDH:
                         N, D, H = param.get_value().shape
                         reshape_dims = (N, H, D)
@@ -903,7 +908,7 @@ class JaxAutoWeightsLoader(AutoWeightsLoader):
                     N, H = param.get_value().shape
                     reshape_dims = (N, H)
                     permute_dims = (0, 1)
-                elif "o_proj.weight" in name:
+                elif "o_proj.weight" in name and param.get_value().ndim == 3:
                     N, H, D = param.get_value().shape
                     reshape_dims = (D, N, H)
                     permute_dims = (1, 2, 0)
