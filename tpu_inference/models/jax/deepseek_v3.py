@@ -262,14 +262,17 @@ class DeepseekV3BaseAttention(JaxModule):
                                                   self.ap_sharding),
                 prefix=self.prefix + ".q_b_proj")
         else:
+            # 3D kernel (D, N, qk_head_dim) so the standard q_proj weight-loader
+            # path applies (it reshapes HF q_proj.weight to (N, H, D) and
+            # permutes to (D, N, H)); heads shard over the attention head axis.
             self.q_proj = JaxEinsum(
-                einsum_str="TD,DP->TP",
-                kernel_shape=(self.D, self.N * self.qk_head_dim),
+                einsum_str="TD,DNH->TNH",
+                kernel_shape=(self.D, self.N, self.qk_head_dim),
                 rngs=rngs,
                 quant_config=self.quant_config,
                 param_dtype=self.dtype,
-                kernel_init=nnx.with_partitioning(weight_init,
-                                                  self.ap_sharding),
+                kernel_init=nnx.with_partitioning(
+                    weight_init, P(None, ShardingAxisName.ATTN_HEAD, None)),
                 prefix=self.prefix + ".q_proj")
 
         self.kv_a_proj_with_mqa = JaxEinsum(
@@ -338,9 +341,9 @@ class DeepseekV3BaseAttention(JaxModule):
             q_TA = self.q_a_proj(x_q_TD)
             q_TA = self.q_a_layernorm(q_TA)
             q_TP = self.q_b_proj(q_TA)
-        else:
-            q_TP = self.q_proj(x_q_TD)
-        return q_TP.reshape(q_TP.shape[0], self.N, self.qk_head_dim)
+            return q_TP.reshape(q_TP.shape[0], self.N, self.qk_head_dim)
+        # q_proj is a 3D einsum (TD,DNH->TNH) -> already (tokens, heads, head_dim).
+        return self.q_proj(x_q_TD)
 
     @abstractmethod
     def compute_q_projection(self, *args) -> jax.Array:
