@@ -614,10 +614,12 @@ class MLAEinsum(JaxEinsum):
             self.loaded.add(name)
         if len(self.loaded) != len(named_params):
             return
-        if self.quant_config is None:
-            # Unquantized (bf16) path, e.g. DeepSeek-V2-Lite: split the loaded
-            # kv_b_proj weight directly into k_up_proj / v_up_proj with no fp8
-            # dequant. Mirrors the quantized path below minus quantization.
+        if not hasattr(self, "weight_scale_inv"):
+            # Unquantized (bf16) path, e.g. DeepSeek-V2-Lite: no fp8 scale param
+            # exists (quant_config may be a non-None no-op object, so we key on
+            # the actual absence of weight_scale_inv rather than on quant_config).
+            # Split the loaded kv_b_proj weight directly into k_up_proj /
+            # v_up_proj with no fp8 dequant. Mirrors the quantized path below.
             A, N, qk_nope_head_dim, v_head_dim = (
                 self.mla_layer.kv_lora_rank, self.mla_layer.N,
                 self.mla_layer.qk_nope_head_dim, self.mla_layer.v_head_dim)
