@@ -32,6 +32,7 @@ from tpu_inference.kernels.sparse_core.ragged_gather_reduce import \
     ragged_gather_reduce as ragged_gather_reduce_v1
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce as ragged_gather_reduce_v2
+from tpu_inference.kernels.sparse_core.indep_combine import indep_combine
 from tpu_inference.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from tpu_inference.layers.common.quantization import quantize_tensor
 from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -311,6 +312,13 @@ def moe_gmm_local(x: jax.Array,
                 combine = (onehot * cur_weights[..., None] *
                            cur_mask).sum(axis=1)
                 chunk_hidden = combine @ gmm2_res
+            elif envs.MOE_COMBINE_INDEP:
+                # `indep` no-carry SC kernel + divisor-pad preprocess (sparse
+                # EP path). Drop-in for ragged_gather_reduce; gated off by
+                # default. See kernels/sparse_core/indep_combine.py.
+                chunk_hidden = indep_combine(gmm2_res, cur_indices,
+                                             cur_weights.reshape(-1),
+                                             cur_mask.reshape(-1), topk)
             else:
                 chunk_hidden = ragged_gather_reduce(gmm2_res, cur_indices,
                                                     cur_weights.reshape(-1),

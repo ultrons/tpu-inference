@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     USE_MOE_EP_KERNEL: bool = False
     USE_UNFUSED_MEGABLOCKS: bool = False
     USE_DENSE_MOE: bool = False
+    # Use the `indep` (no cross-tile carry) SparseCore MoE combine kernel with a
+    # divisor-pad preprocess, instead of the serial-carry ragged_gather_reduce.
+    MOE_COMBINE_INDEP: bool = False
     NUM_SLICES: int = 1
     RAY_USAGE_STATS_ENABLED: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
@@ -270,6 +273,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # NOTE: this is a naive implementation and should not be used in production
     "USE_DENSE_MOE":
     env_bool("USE_DENSE_MOE", default=False),
+    # Use the `indep` (no-carry) SparseCore MoE combine kernel + divisor-pad
+    # preprocess at the sparse (EP>1) combine site in fused_moe_gmm.
+    "MOE_COMBINE_INDEP":
+    env_bool("MOE_COMBINE_INDEP", default=False),
     # Number of TPU slices for multi-slice mesh
     "NUM_SLICES":
     lambda: int(os.getenv("NUM_SLICES") or "1"),
