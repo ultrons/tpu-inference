@@ -199,6 +199,22 @@ def indep_combine(x, indices, topk_weights, valid_rows_mask, reduce_group_size):
                                   constant_values=False)
     T_pad = P_pad // K
 
+    # Valid-first pack per token (what v2's _preprocess does): stable-sort each
+    # token's K slots so valid ones lead. prep_div_dummy keeps the first L ranks,
+    # so without this it silently drops valid slots when the mask is SCATTERED
+    # within a token (the real EP combine case). Zero invalid weights so the
+    # kept padding rows (ranks V..L-1) contribute 0.
+    idx2 = indices.reshape(T_pad, K)
+    w2 = topk_weights.reshape(T_pad, K)
+    v2 = valid_rows_mask.reshape(T_pad, K)
+    order = jnp.argsort(~v2, axis=-1, stable=True)
+    idx2 = jnp.take_along_axis(idx2, order, axis=-1)
+    v2s = jnp.take_along_axis(v2, order, axis=-1)
+    w2 = jnp.where(v2s, jnp.take_along_axis(w2, order, axis=-1), 0.0)
+    indices = idx2.reshape(-1)
+    topk_weights = w2.reshape(-1)
+    valid_rows_mask = v2s.reshape(-1)
+
     src, dst, w, nrows = prep_div_dummy(indices, topk_weights, valid_rows_mask,
                                         K, RP)
     # Token has >=1 valid slot -> keep; all-invalid token -> zeroed output row.
